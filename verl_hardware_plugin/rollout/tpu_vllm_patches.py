@@ -149,7 +149,7 @@ def patch_tpu_sampler() -> None:
     # functools.wraps copies torch.compile's bookkeeping attributes, which can let
     # Dynamo unwrap straight to the compiled function and skip the redraw.
     sample_from_logits.__doc__ = getattr(original, "__doc__", None)
-    sample_from_logits.__wrapped__ = original
+    sample_from_logits.__wrapped__ = original  # type: ignore[attr-defined]
     TPUModelRunner.sample_from_logits = sample_from_logits
     TPUModelRunner._verl_fp32_sampler_patched = True
     logger.info("Applied TPU generator FP32 sampling-noise patch.")
