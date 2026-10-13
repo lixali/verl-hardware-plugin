@@ -16,7 +16,7 @@ This keeps all TPU TorchTitan training specializations out-of-tree in
 - Host-side global token counting (avoiding eager device collectives inside the XLA SPMD trace)
 - Graph-break loss synchronization between forward and backward
 - Sequence-length bucketing for both packed (``use_remove_padding=True``) and padded inputs
-- Shape-stable ``_tpu_padded_values`` attachment, which verl's TPU loss path consumes
+- Plugin-local adapters preserving gradients for bucket-padded SFT and RL loss inputs
 """
 
 from __future__ import annotations

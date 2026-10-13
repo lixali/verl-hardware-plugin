@@ -772,13 +772,54 @@ class _TPULossDataProxy:
 
 
 def prepare_tpu_loss_inputs(model_output: dict[str, Any], micro_batch: TensorDict) -> tuple[dict[str, Any], Any]:
-    """Adapt ``(model_output, micro_batch)`` so unmodified ``verl.workers.utils.losses.sft_loss``
-    consumes the static bucket-padded TPU ``log_probs`` and a matching bucket-padded ``loss_mask``.
+    """Adapt differentiable TPU outputs for the unmodified SFT and PPO loss APIs.
+
+    SFT consumes full bucket-padded buffers and a matching loss mask. PPO receives
+    valid packed outputs and a real TensorDict with padded response fields on device.
     """
     log_prob = model_output.get("log_probs")
     tpu_padded_log_prob = getattr(log_prob, TPU_PADDED_VALUES_ATTR, None)
     if tpu_padded_log_prob is None:
         return model_output, micro_batch
+
+    if "old_log_probs" in micro_batch and "advantages" in micro_batch:
+        loss_model_output = dict(model_output)
+        for key, tensor in model_output.items():
+            padded_values = getattr(tensor, TPU_PADDED_VALUES_ATTR, None)
+            if padded_values is not None:
+                # Trim trailing bucket padding inside the plugin without detaching gradients.
+                valid_count = int(tensor.offsets()[-1].item())
+                loss_model_output[key] = _TPUPaddedJaggedProxy(padded_values[:valid_count], tensor)
+
+        # Preserve host sequence metadata while moving response fields independently
+        # of the source TensorDict's device setting.
+        loss_data = TensorDict(micro_batch, batch_size=micro_batch.batch_size)
+        responses = micro_batch["responses"]
+        if micro_batch["prompts"].is_nested:
+            response_width = int(unwrap_metadata(tu.get_non_tensor_data(micro_batch, "max_response_len", -1)))
+            aligned_width = int(unwrap_metadata(tu.get_non_tensor_data(micro_batch, "tpu_max_response_len", 0)) or 0)
+            actual_width = int(responses.offsets().diff().max().item())
+            if response_width < 0:
+                response_width = actual_width
+            response_width = max(response_width, aligned_width)
+            if response_width < actual_width:
+                raise ValueError("max_response_len must accommodate every response")
+        else:
+            response_width = responses.shape[1]
+
+        fields = ["response_mask", "old_log_probs", "advantages"]
+        fields.extend(key for key in ("ref_log_prob", "rollout_is_weights") if key in micro_batch)
+        padded_fields = micro_batch.select(*fields).to_padded_tensor()
+        if micro_batch["prompts"].is_nested:
+            # Legacy batches can retain response fields wider than the packed response bucket.
+            response_width = max(response_width, *(tensor.shape[1] for tensor in padded_fields.values()))
+            tu.assign_non_tensor_data(loss_data, "max_response_len", response_width)
+        for key, tensor in padded_fields.items():
+            if tensor.shape[1] > response_width:
+                raise ValueError(f"{key} exceeds max_response_len ({tensor.shape[1]} > {response_width})")
+            loss_data[key] = F.pad(tensor, (0, response_width - tensor.shape[1])).to(tpu_padded_log_prob.device)
+
+        return loss_model_output, loss_data
 
     if "loss_mask" not in micro_batch.keys() or "responses" in micro_batch.keys():
         return model_output, micro_batch
